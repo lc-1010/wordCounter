@@ -5,9 +5,11 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/PuerkitoBio/goquery"
 )
@@ -16,21 +18,50 @@ type wordFrequencies struct {
 	Key   string
 	Value int
 }
+type wordMap struct {
+	word map[string]int
+	sync.Mutex
+}
 
 func main() {
 	url := "https://github.com/rust-lang/book/tree/main/src"
 	rawUrl := "https://raw.githubusercontent.com/rust-lang/book/main/src/"
-	list := ExtractEmbeddedUrlsFromGithub(url, rawUrl)
-	word := make(chan string, 1)
-	freq := make(chan map[string]int)
-	for _, l := range list {
-		go readMd(l, word, freq)
+	lists := ExtractEmbeddedUrlsFromGithub(url, rawUrl)
+	word := make(chan []string, len(lists))
+	freq := make(chan map[string]int, 1)
+	done := make(chan int, 1)
+
+	for _, item := range lists {
+		go getContent(item, word, done)
 	}
-	countWordFrequencies(list, word, freq)
+	countWordFrequencies(word, freq, done, len(lists))
+
+	wordMapList := <-freq
+	//fmt.Println("wordMapList", wordMapList)
+	res := sortMapByValue(wordMapList)
+	file, err := os.OpenFile("word_list.txt", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer file.Close()
+	for _, item := range res {
+		if len(item.Key) > 15 { //catastrophic
+			continue
+		}
+		_, err := file.Write([]byte(item.Key + " "))
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
 
 }
 
-func readMd(url string, w chan string, f chan map[string]int) {
+func getContent(url string, w chan []string, d chan int) {
+	body := getBody(url)
+	readMd(body, w, d)
+}
+
+func getBody(url string) string {
 	respone, err := http.Get(url)
 	if err != nil {
 		log.Fatal(err)
@@ -40,16 +71,13 @@ func readMd(url string, w chan string, f chan map[string]int) {
 	if err != nil {
 		log.Fatal(err)
 	}
+	return string(body)
+}
+
+func readMd(body string, w chan []string, d chan int) {
 	content := cleanText(string(body))
 	wordList := strings.Fields(content)
-	//fmt.Println(wordList[10:30])
-
-	countWordFrequencies(wordList, w, f)
-	// result := sortMapByValue(res)
-	// fmt.Println(len(result))
-	// for _, w := range result {
-	// 	fmt.Println(w)
-	// }
+	w <- wordList
 
 }
 
@@ -67,12 +95,30 @@ func sortMapByValue(word map[string]int) []wordFrequencies {
 	return sortedWords
 }
 
-func countWordFrequencies(words []string, w chan string, freq chan map[string]int) {
-	wordFrequencies := make(map[string]int)
-	for _, word := range words {
-		wordFrequencies[word]++
+func countWordFrequencies(w chan []string, freq chan map[string]int, cnt chan int, pageCnt int) {
+	i := 0
+	res := wordMap{
+		word: map[string]int{},
 	}
-	freq <- wordFrequencies
+	for {
+		select {
+		case words := <-w:
+			for _, word := range words {
+
+				res.Lock()
+				res.word[word]++
+				res.Unlock()
+
+			}
+			i++
+			if i == pageCnt {
+				cnt <- len(res.word)
+			}
+		case <-cnt:
+			freq <- res.word
+			return
+		}
+	}
 }
 
 func cleanText(text string) string {
