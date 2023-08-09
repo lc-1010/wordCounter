@@ -18,28 +18,23 @@ type wordFrequencies struct {
 	Key   string
 	Value int
 }
-type wordMap struct {
-	word map[string]int
-	sync.Mutex
-}
 
 func main() {
 	url := "https://github.com/rust-lang/book/tree/main/src"
 	rawUrl := "https://raw.githubusercontent.com/rust-lang/book/main/src/"
-	lists := ExtractEmbeddedUrlsFromGithub(url, rawUrl)
-	word := make(chan []string, len(lists))
-	freq := make(chan map[string]int, 1)
-	done := make(chan int, 1)
 
-	for _, item := range lists {
-		go getContent(item, word, done)
+	urls := urls{
+		Url:    url,
+		RawUrl: rawUrl,
 	}
-	countWordFrequencies(word, freq, done, len(lists))
+	fileName := "word_list.txt"
+	fileExtension := "ch"
+	res := urls.readRepo(fileExtension)
+	writeFile(res, fileName)
+}
 
-	wordMapList := <-freq
-	//fmt.Println("wordMapList", wordMapList)
-	res := sortMapByValue(wordMapList)
-	file, err := os.OpenFile("word_list.txt", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+func writeFile(res []wordFrequencies, fileName string) {
+	file, err := os.OpenFile(fileName, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -53,15 +48,9 @@ func main() {
 			log.Fatal(err)
 		}
 	}
-
 }
 
-func getContent(url string, w chan []string, d chan int) {
-	body := getBody(url)
-	readMd(body, w, d)
-}
-
-func getBody(url string) string {
+func getContent(url string) string {
 	respone, err := http.Get(url)
 	if err != nil {
 		log.Fatal(err)
@@ -74,51 +63,28 @@ func getBody(url string) string {
 	return string(body)
 }
 
-func readMd(body string, w chan []string, d chan int) {
+func getWordList(body string) []string {
 	content := cleanText(string(body))
 	wordList := strings.Fields(content)
-	w <- wordList
+	return wordList
 
 }
 
-func sortMapByValue(word map[string]int) []wordFrequencies {
+func sortMapByValue(word *sync.Map) []wordFrequencies {
 	var sortedWords []wordFrequencies
-	for w, frequency := range word {
+
+	word.Range(func(key, value any) bool {
 		sortedWords = append(sortedWords, wordFrequencies{
-			Key:   w,
-			Value: frequency,
+			Key:   key.(string),
+			Value: value.(int),
 		})
-	}
+		return true
+	})
+
 	sort.Slice(sortedWords, func(i, j int) bool {
 		return sortedWords[i].Value > sortedWords[j].Value
 	})
 	return sortedWords
-}
-
-func countWordFrequencies(w chan []string, freq chan map[string]int, cnt chan int, pageCnt int) {
-	i := 0
-	res := wordMap{
-		word: map[string]int{},
-	}
-	for {
-		select {
-		case words := <-w:
-			for _, word := range words {
-
-				res.Lock()
-				res.word[word]++
-				res.Unlock()
-
-			}
-			i++
-			if i == pageCnt {
-				cnt <- len(res.word)
-			}
-		case <-cnt:
-			freq <- res.word
-			return
-		}
-	}
 }
 
 func cleanText(text string) string {
@@ -132,7 +98,7 @@ func cleanText(text string) string {
 	return cleanedText
 }
 
-func ExtractEmbeddedUrlsFromGithub(url string, rawUrl string) []string {
+func ExtractEmbeddedUrlsFromGithub(url string, rawUrl string, fileExtension string) []string {
 	response, err := http.Get(url)
 	if err != nil {
 		log.Fatal(err)
@@ -166,7 +132,7 @@ func ExtractEmbeddedUrlsFromGithub(url string, rawUrl string) []string {
 					item := tree["items"].([]any)
 					for _, k := range item {
 						ff := k.(map[string]any)["name"].(string)
-						if strings.HasPrefix(ff, "ch") {
+						if strings.HasPrefix(ff, fileExtension) {
 							res = append(res, rawUrl+ff)
 						}
 					}
@@ -175,4 +141,65 @@ func ExtractEmbeddedUrlsFromGithub(url string, rawUrl string) []string {
 		}
 	})
 	return res
+}
+
+type urls struct {
+	Url    string
+	RawUrl string
+}
+
+func (u urls) readRepo(fileExtension string) []wordFrequencies {
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	var wordMap sync.Map
+	wg.Add(1)
+	go func(u string, rawUrl string, w *sync.Map) {
+		defer wg.Done()
+		processPage(u, rawUrl, w, fileExtension)
+	}(u.Url, u.RawUrl, &wordMap)
+
+	wg.Wait()
+	close(done)
+
+	strotedWords := sortMapByValue(&wordMap)
+	return strotedWords
+}
+
+func processPage(u string, r string, wordMap *sync.Map, fileExtension string) {
+	list := ExtractEmbeddedUrlsFromGithub(u, r, fileExtension)
+	wordChan := make(chan []string, len(list))
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+
+	for _, item := range list {
+		wg.Add(1)
+		go func(itme string) {
+			defer wg.Done()
+			content := getContent(itme)
+			wordList := getWordList(content)
+			wordChan <- wordList
+		}(item)
+
+	}
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	countWordFrequencies(wordChan, done, wordMap)
+}
+
+func countWordFrequencies(w chan []string, d chan struct{}, wordMap *sync.Map) *sync.Map {
+	for {
+		select {
+		case word := <-w:
+			for _, w := range word {
+				c, res := wordMap.LoadOrStore(w, 1)
+				if res {
+					wordMap.Store(w, c.(int)+1)
+				}
+			}
+		case <-d:
+			return wordMap
+		}
+	}
 }
